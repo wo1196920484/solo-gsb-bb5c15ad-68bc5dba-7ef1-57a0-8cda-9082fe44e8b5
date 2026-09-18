@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    DB_PATH=/data/tasks.db
+    DB_PATH=/data/tasks.db \
+    DEFAULT_DURATION_SECONDS=1
 
 WORKDIR /app
 

@@ -6,6 +6,7 @@ services:
     environment:
       DB_PATH: /data/tasks.db
       DEFAULT_LEASE_SECONDS: "30"
+      DEFAULT_DURATION_SECONDS: "1"
     volumes:
       - task-data:/data
     healthcheck:

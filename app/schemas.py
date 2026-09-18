@@ -14,6 +14,9 @@ class TaskIn(BaseModel):
     deps: list[str] = Field(default_factory=list, description="前置任务的 key 列表")
     max_retries: int = Field(0, ge=0, description="失败后的额外重试次数")
     lease_seconds: float | None = Field(None, gt=0, description="租约时长，缺省取服务端默认值")
+    duration_seconds: float | None = Field(
+        None, gt=0, allow_inf_nan=False, description="预计执行时长（秒），缺省为 1；用于只读分析"
+    )
 
 
 class DAGSubmitIn(BaseModel):

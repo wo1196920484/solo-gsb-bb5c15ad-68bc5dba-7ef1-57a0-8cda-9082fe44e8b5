@@ -1,13 +1,15 @@
-"""核心业务逻辑：提交校验、原子领取、租约心跳、结果回报与状态查询。"""
+"""核心业务逻辑：提交校验、原子领取、租约心跳、结果回报、状态查询与只读分析。"""
 
 from __future__ import annotations
 
+import heapq
 import json
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .db import get_conn, get_default_lease_seconds
+from .db import get_conn, get_default_duration_seconds, get_default_lease_seconds
 
 # 任务状态
 PENDING = "pending"
@@ -167,6 +169,7 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
         raise APIError(422, "cycle_detected", "依赖图存在环，必须是 DAG", {"cycle": cycle})
 
     default_lease = get_default_lease_seconds()
+    default_duration = get_default_duration_seconds()
     now = _iso(_now())
 
     with get_conn() as conn:
@@ -187,10 +190,11 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
             for key in keys:
                 t = tasks_by_key[key]
                 lease = float(t.get("lease_seconds") or default_lease)
+                duration = float(t.get("duration_seconds") or default_duration)
                 conn.execute(
                     """INSERT INTO tasks (id, dag_id, task_key, name, payload,
-                           max_retries, lease_seconds, state, attempt, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                           max_retries, lease_seconds, duration_seconds, state, attempt, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
                     (
                         uuid.uuid4().hex,
                         dag_id,
@@ -199,6 +203,7 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                         _dumps(t.get("payload")),
                         int(t.get("max_retries") or 0),
                         lease,
+                        duration,
                         PENDING,
                         now,
                     ),
@@ -655,6 +660,7 @@ def _task_dict(conn, row, with_attempts: bool = True) -> dict[str, Any]:
         "attempt": row["attempt"],
         "failure_count": row["failure_count"],
         "max_retries": row["max_retries"],
+        "duration_seconds": row["duration_seconds"],
         # 剩余重试额度只与显式失败计数挂钩，与 attempt（含租约过期重领）无关
         "retries_remaining": max(0, row["max_retries"] - row["failure_count"]),
         "lease": lease,
@@ -702,6 +708,145 @@ def get_dag(dag_id: str) -> dict[str, Any]:
             "states": _dag_summary(conn, dag_id),
             "tasks": [_task_dict(conn, r, with_attempts=False) for r in rows],
         }
+
+
+# ---------------------------------------------------------------- 只读分析
+
+# 浮点时差判零阈值：关键任务 = 总时差不超过该值
+_SLACK_EPS = 1e-9
+
+
+def analyze_dag(dag_id: str) -> dict[str, Any]:
+    """关键路径分析（CPM）：按声明的 duration_seconds 计算排程。
+
+    纯只读：在单个只读事务内取一致快照（WAL 下读写互不阻塞，事务期间
+    并发写入不影响本次读取），随后在内存中计算——不改任务状态、不写库、
+    不产生事件，可安全地并发/重复调用。
+    """
+    with get_conn() as conn:
+        conn.execute("BEGIN")  # 只读事务：本次分析的所有读取看到同一快照
+        try:
+            dag = conn.execute("SELECT * FROM dags WHERE id = ?", (dag_id,)).fetchone()
+            if dag is None:
+                raise APIError(404, "dag_not_found", f"DAG {dag_id} 不存在")
+            task_rows = conn.execute(
+                "SELECT task_key, duration_seconds FROM tasks WHERE dag_id = ?", (dag_id,)
+            ).fetchall()
+            dep_rows = conn.execute(
+                "SELECT task_key, dep_key FROM dependencies WHERE dag_id = ?", (dag_id,)
+            ).fetchall()
+        finally:
+            conn.execute("ROLLBACK")  # 纯读取：不提交任何变更
+
+    durations = {r["task_key"]: float(r["duration_seconds"]) for r in task_rows}
+    deps: dict[str, list[str]] = {k: [] for k in durations}
+    for r in dep_rows:
+        deps.setdefault(r["task_key"], []).append(r["dep_key"])
+
+    # 防御性校验：正常提交路径已保证时长为正且图合法，但分析对存储内容重新校验，
+    # 使历史遗留/外部写入的异常数据也得到明确的 422 而非错误排程。
+    bad_duration = sorted(
+        k for k, d in durations.items() if not math.isfinite(d) or d <= 0
+    )
+    if bad_duration:
+        raise APIError(
+            422, "invalid_duration", "存在非正的 duration_seconds", {"keys": bad_duration}
+        )
+    referenced = {r["task_key"] for r in dep_rows} | {r["dep_key"] for r in dep_rows}
+    missing = sorted(referenced - durations.keys())
+    if missing:
+        raise APIError(
+            422, "missing_dependency", "存在指向未声明任务的依赖边", {"missing": missing}
+        )
+    cycle = _find_cycle(set(durations), deps)
+    if cycle:
+        raise APIError(422, "cycle_detected", "依赖图存在环，必须是 DAG", {"cycle": cycle})
+
+    keys = sorted(durations)
+    succ: dict[str, list[str]] = {k: [] for k in keys}
+    indeg = {k: len(deps[k]) for k in keys}
+    for k in keys:
+        for d in deps[k]:
+            succ[d].append(k)
+
+    # 拓扑序（Kahn，堆按 key 字典序保证结果确定）
+    heap = [k for k in keys if indeg[k] == 0]
+    heapq.heapify(heap)
+    topo: list[str] = []
+    while heap:
+        u = heapq.heappop(heap)
+        topo.append(u)
+        for s in succ[u]:
+            indeg[s] -= 1
+            if indeg[s] == 0:
+                heapq.heappush(heap, s)
+
+    # 前向传递：最早开始/完成（所有前置完成后即可开始）
+    es: dict[str, float] = {}
+    ef: dict[str, float] = {}
+    for k in topo:
+        es[k] = max((ef[d] for d in deps[k]), default=0.0)
+        ef[k] = es[k] + durations[k]
+    total = max(ef.values(), default=0.0)
+
+    # 后向传递：最晚开始/完成（汇点的最晚完成 = 总工期）
+    ls: dict[str, float] = {}
+    lf: dict[str, float] = {}
+    for k in reversed(topo):
+        lf[k] = min((ls[s] for s in succ[k]), default=total)
+        ls[k] = lf[k] - durations[k]
+
+    critical = {k for k in keys if ls[k] - es[k] <= _SLACK_EPS}
+
+    # 并行层级：到源点的最长距离（按边数）。同层任务互不依赖、可并行执行；
+    # 层数即任务数口径下的最小串行批次数。
+    level: dict[str, int] = {}
+    for k in topo:
+        level[k] = 0 if not deps[k] else 1 + max(level[d] for d in deps[k])
+    levels: list[list[str]] = []
+    for k in keys:  # keys 已按字典序排序，层内顺序确定
+        while len(levels) <= level[k]:
+            levels.append([])
+        levels[level[k]].append(k)
+
+    # 关键路径：从零时差的源点出发，沿「最早开始 == 前驱最早完成」的关键后继
+    # 走到汇点；平局取较小 key，保证多次调用结果一致。
+    path: list[str] = []
+    starts = sorted(k for k in critical if es[k] <= _SLACK_EPS)
+    if starts:
+        path = [starts[0]]
+        while True:
+            nxt = sorted(
+                s for s in succ[path[-1]]
+                if s in critical and abs(es[s] - ef[path[-1]]) <= _SLACK_EPS
+            )
+            if not nxt:
+                break
+            path.append(nxt[0])
+
+    return {
+        "dag_id": dag_id,
+        "name": dag["name"],
+        "task_count": len(keys),
+        "total_duration_seconds": total,
+        "critical_path": path,
+        "critical_tasks": sorted(critical),
+        "levels": levels,
+        "tasks": [
+            {
+                "key": k,
+                "duration_seconds": durations[k],
+                "earliest_start": es[k],
+                "earliest_finish": ef[k],
+                "latest_start": ls[k],
+                "latest_finish": lf[k],
+                "slack": max(0.0, ls[k] - es[k]),
+                "critical": k in critical,
+                "level": level[k],
+            }
+            for k in keys
+        ],
+    }
 
 
 def list_tasks(dag_id: str | None, state: str | None) -> dict[str, Any]:

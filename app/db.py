@@ -16,6 +16,9 @@ from typing import Iterator
 # 默认租约时长（秒），任务可用 lease_seconds 覆盖。
 DEFAULT_LEASE_SECONDS = 30.0
 
+# 默认任务时长（秒），任务可用 duration_seconds 覆盖；只读分析据此排程。
+DEFAULT_DURATION_SECONDS = 1.0
+
 
 def db_path() -> Path:
     return Path(os.environ.get("DB_PATH", "./data/tasks.db"))
@@ -23,6 +26,10 @@ def db_path() -> Path:
 
 def get_default_lease_seconds() -> float:
     return float(os.environ.get("DEFAULT_LEASE_SECONDS", DEFAULT_LEASE_SECONDS))
+
+
+def get_default_duration_seconds() -> float:
+    return float(os.environ.get("DEFAULT_DURATION_SECONDS", DEFAULT_DURATION_SECONDS))
 
 
 def _connect(path: Path | None = None) -> sqlite3.Connection:
@@ -59,6 +66,8 @@ def init_db(path: Path | None = None) -> None:
                 payload             TEXT,
                 max_retries         INTEGER NOT NULL DEFAULT 0,
                 lease_seconds       REAL NOT NULL,
+                -- 预计执行时长（秒），只读分析用于关键路径/排程计算
+                duration_seconds    REAL NOT NULL DEFAULT 1.0,
                 state               TEXT NOT NULL,        -- pending/running/succeeded/failed/blocked
                 blocked_reason      TEXT,
                 lease_token         TEXT,
@@ -149,6 +158,11 @@ def init_db(path: Path | None = None) -> None:
         if "failure_count" not in columns:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0"
+            )
+        # 旧库迁移：为已有任务补齐预计时长列，默认 1 秒（与分析缺省口径一致）。
+        if "duration_seconds" not in columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN duration_seconds REAL NOT NULL DEFAULT 1.0"
             )
 
 

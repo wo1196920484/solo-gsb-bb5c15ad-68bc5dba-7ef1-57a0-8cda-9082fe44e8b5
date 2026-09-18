@@ -38,6 +38,12 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   跨页与重启均不漏项、不重复。
 - **状态接口**：DAG 概览给出各状态计数；任务详情列出每次尝试的状态、租约令牌、
   过期时间、心跳时间、错误信息，以及当前租约是否已过期和阻塞原因。
+- **只读分析**：`GET /dags/{dag_id}/analysis` 按任务声明的 `duration_seconds`
+  （缺省 1 秒）在依赖图上做关键路径分析（CPM）：每个任务的最早开始/完成时间、
+  最晚开始/完成时间与总时差、总工期、关键路径、关键任务集合与并行层级
+  （同层任务互不依赖、可并行执行）。分析在**单个只读事务**内读取一致快照，
+  随后纯内存计算——不改变任务状态、不产生事件，可并发/重复调用且结果确定。
+  DAG 不存在返回 404；存储数据中出现非正时长或图异常（环、悬空依赖）返回 422。
 
 ## 一条命令启动（端口 8000）
 
@@ -56,7 +62,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 可用环境变量：`DB_PATH`（默认 `./data/tasks.db`）、`DEFAULT_LEASE_SECONDS`
-（默认 30，任务可用 `lease_seconds` 单独覆盖）。
+（默认 30，任务可用 `lease_seconds` 单独覆盖）、`DEFAULT_DURATION_SECONDS`
+（默认 1，任务可用 `duration_seconds` 单独覆盖，用于只读分析）。
 
 ## 调用示例
 
@@ -70,8 +77,8 @@ curl -s -X POST http://localhost:8000/dags \
   -d '{
     "name": "etl",
     "tasks": [
-      {"key": "extract",   "lease_seconds": 60},
-      {"key": "transform", "deps": ["extract"], "max_retries": 2, "lease_seconds": 60},
+      {"key": "extract",   "lease_seconds": 60, "duration_seconds": 3},
+      {"key": "transform", "deps": ["extract"], "max_retries": 2, "lease_seconds": 60, "duration_seconds": 5},
       {"key": "load",      "deps": ["transform"]}
     ]
   }'
@@ -243,6 +250,44 @@ curl -s 'http://localhost:8000/events?after=0&limit=50'
 curl -s 'http://localhost:8000/events?dag_id=<DAG_ID>&after=0&limit=100'
 ```
 
+### 7. 只读分析（关键路径）
+
+按任务声明的 `duration_seconds`（缺省 1）对整个 DAG 做关键路径分析，
+与任务当前运行状态无关，纯粹回答「如果现在开始，理想排程长什么样」：
+
+```bash
+curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
+```
+
+```json
+{
+  "dag_id": "…",
+  "task_count": 3,
+  "total_duration_seconds": 9.0,
+  "critical_path": ["extract", "transform", "load"],
+  "critical_tasks": ["extract", "transform", "load"],
+  "levels": [["extract"], ["transform"], ["load"]],
+  "tasks": [
+    {"key": "extract",   "duration_seconds": 3.0, "earliest_start": 0.0, "earliest_finish": 3.0,
+     "latest_start": 0.0, "latest_finish": 3.0, "slack": 0.0, "critical": true,  "level": 0},
+    {"key": "transform", "duration_seconds": 5.0, "earliest_start": 3.0, "earliest_finish": 8.0,
+     "latest_start": 3.0, "latest_finish": 8.0, "slack": 0.0, "critical": true,  "level": 1},
+    {"key": "load",      "duration_seconds": 1.0, "earliest_start": 8.0, "earliest_finish": 9.0,
+     "latest_start": 8.0, "latest_finish": 9.0, "slack": 0.0, "critical": true,  "level": 2}
+  ]
+}
+```
+
+- `earliest_start` / `earliest_finish`：所有前置完成即可开始口径下的最早时间；
+  `latest_start` / `latest_finish`：不拖延总工期口径下的最晚时间；
+  `slack` 为总时差，`slack ≈ 0` 的任务构成 `critical_tasks`（关键任务集合）。
+- `critical_path` 为一条从源点到汇点的关键路径（并列时按任务键字典序取确定的一条）；
+  `levels` 为并行层级：第 i 层任务的全部前置都在更浅的层，同层任务可并行执行。
+- 分析在单个只读事务内读取一致快照后纯内存计算：不改任务状态、不产生事件，
+  可并发/重复调用，结果确定。DAG 不存在 → `404 dag_not_found`；
+  存储数据中出现非正 `duration_seconds` → `422 invalid_duration`，
+  图异常（环、悬空依赖）→ `422 cycle_detected` / `422 missing_dependency`。
+
 状态变迁与事件 `type` 的对应关系：
 
 | 业务动作 | 事件 type | from_state → to_state |
@@ -260,6 +305,7 @@ curl -s 'http://localhost:8000/events?dag_id=<DAG_ID>&after=0&limit=100'
 | --- | --- | --- |
 | `POST` | `/dags` | 提交 DAG（校验缺失依赖与环） |
 | `GET` | `/dags/{dag_id}` | DAG 概览：状态计数与任务列表 |
+| `GET` | `/dags/{dag_id}/analysis` | 只读分析：最早/最晚时间、总工期、关键路径与并行层级 |
 | `POST` | `/tasks/claim` | 原子领取前置全部成功的任务 |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
 | `GET` | `/events?after=&limit=&dag_id=` | 不可变事件流：按 sequence 升序键集分页 |
@@ -289,4 +335,7 @@ pytest -q
 attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试与耗尽后递归阻塞、
 幂等回报（重放同响应、内容冲突 409、键序等价、重启后持久化）、旧 SQLite 数据迁移、
 状态接口、持久化事件流（各事件类型与状态对、同事务回滚不留事件、重放不产生事件、
-键集分页无漏项/重复、dag_id 过滤、参数校验、重启后不重置、存储层不可变）。
+键集分页无漏项/重复、dag_id 过滤、参数校验、重启后不重置、存储层不可变）、
+只读分析（最早/最晚时间与总时差、总工期、关键路径与关键任务集合、并行层级、
+默认与小数时长、并列关键路径的确定性、只读不产生事件、404/422 错误路径、
+旧库迁移后默认时长）。

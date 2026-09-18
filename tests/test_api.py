@@ -803,3 +803,223 @@ def test_event_stream_is_immutable_in_storage(client):
 
     events = client.get("/events").json()["events"]
     assert events[0]["type"] == "dag.created"
+
+
+# ------------------------------------------------------------- 只读分析
+
+def test_analysis_computes_schedule_critical_path_and_levels(client):
+    submit(
+        client,
+        [
+            {"key": "a", "duration_seconds": 3},
+            {"key": "b", "deps": ["a"], "duration_seconds": 2},
+            {"key": "c", "deps": ["a"], "duration_seconds": 5},
+            {"key": "d", "deps": ["b", "c"]},  # 未声明时长 -> 默认 1
+        ],
+        dag_id="ana-1",
+    )
+    r = client.get("/dags/ana-1/analysis")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["dag_id"] == "ana-1"
+    assert body["task_count"] == 4
+
+    tasks = {t["key"]: t for t in body["tasks"]}
+    # a: 0-3；b: 3-5；c: 3-8；d: 8-9
+    assert (tasks["a"]["earliest_start"], tasks["a"]["earliest_finish"]) == (0, 3)
+    assert (tasks["b"]["earliest_start"], tasks["b"]["earliest_finish"]) == (3, 5)
+    assert (tasks["c"]["earliest_start"], tasks["c"]["earliest_finish"]) == (3, 8)
+    assert (tasks["d"]["earliest_start"], tasks["d"]["earliest_finish"]) == (8, 9)
+    assert tasks["d"]["duration_seconds"] == 1  # 默认时长
+
+    assert body["total_duration_seconds"] == 9
+    assert body["critical_path"] == ["a", "c", "d"]
+    assert body["critical_tasks"] == ["a", "c", "d"]
+    assert tasks["a"]["critical"] is True and tasks["a"]["slack"] == 0
+    assert tasks["b"]["critical"] is False and tasks["b"]["slack"] == 3
+    assert tasks["b"]["latest_start"] == 6 and tasks["b"]["latest_finish"] == 8
+
+    # 并行层级：同层互不依赖
+    assert body["levels"] == [["a"], ["b", "c"], ["d"]]
+    assert [tasks[k]["level"] for k in "abcd"] == [0, 1, 1, 2]
+
+
+def test_analysis_default_duration_is_one(client):
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="ana-def")
+    body = client.get("/dags/ana-def/analysis").json()
+    assert body["total_duration_seconds"] == 2
+    assert body["critical_path"] == ["a", "b"]
+    assert body["critical_tasks"] == ["a", "b"]
+    assert body["levels"] == [["a"], ["b"]]
+
+
+def test_analysis_fractional_durations(client):
+    submit(
+        client,
+        [
+            {"key": "a", "duration_seconds": 0.5},
+            {"key": "b", "deps": ["a"], "duration_seconds": 0.25},
+        ],
+        dag_id="ana-frac",
+    )
+    body = client.get("/dags/ana-frac/analysis").json()
+    assert body["total_duration_seconds"] == 0.75
+    assert body["critical_path"] == ["a", "b"]
+
+
+def test_analysis_tied_critical_paths_are_deterministic(client):
+    # 两条等长关键路径 a->c 与 b->c：关键任务集合包含全部，路径确定唯一
+    submit(
+        client,
+        [
+            {"key": "a", "duration_seconds": 2},
+            {"key": "b", "duration_seconds": 2},
+            {"key": "c", "deps": ["a", "b"], "duration_seconds": 1},
+        ],
+        dag_id="ana-tie",
+    )
+    body = client.get("/dags/ana-tie/analysis").json()
+    assert body["total_duration_seconds"] == 3
+    assert body["critical_tasks"] == ["a", "b", "c"]
+    assert body["critical_path"] == ["a", "c"]  # 平局取较小 key
+    assert client.get("/dags/ana-tie/analysis").json() == body  # 可重复且一致
+
+
+def test_analysis_unknown_dag_returns_404(client):
+    r = client.get("/dags/nope/analysis")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "dag_not_found"
+
+
+def test_submit_rejects_non_positive_duration(client):
+    for bad in (0, -2, -0.5):
+        r = client.post("/dags", json={"tasks": [{"key": "a", "duration_seconds": bad}]})
+        assert r.status_code == 422
+
+
+def test_analysis_is_read_only(client):
+    submit(
+        client,
+        [{"key": "a", "duration_seconds": 2}, {"key": "b", "deps": ["a"]}],
+        dag_id="ana-ro",
+    )
+    before_events = client.get("/events", params={"dag_id": "ana-ro"}).json()
+    before_dag = client.get("/dags/ana-ro").json()
+
+    r1 = client.get("/dags/ana-ro/analysis")
+    r2 = client.get("/dags/ana-ro/analysis")
+    assert r1.status_code == 200 and r1.json() == r2.json()
+
+    # 分析不改变任务状态，也不产生事件
+    assert client.get("/events", params={"dag_id": "ana-ro"}).json() == before_events
+    assert client.get("/dags/ana-ro").json() == before_dag
+
+
+def test_analysis_rejects_corrupt_duration_in_storage(client):
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="ana-bad")
+    import sqlite3
+    from app.db import db_path
+
+    conn = sqlite3.connect(db_path())
+    conn.execute(
+        "UPDATE tasks SET duration_seconds = 0 WHERE dag_id = 'ana-bad' AND task_key = 'a'"
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.get("/dags/ana-bad/analysis")
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_duration"
+    assert r.json()["error"]["details"]["keys"] == ["a"]
+
+
+def test_analysis_rejects_injected_cycle(client):
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="ana-cyc")
+    import sqlite3
+    from app.db import db_path
+
+    # 绕过提交校验直接写入一条成环的边
+    conn = sqlite3.connect(db_path())
+    conn.execute(
+        "INSERT INTO dependencies (dag_id, task_key, dep_key) VALUES ('ana-cyc', 'a', 'b')"
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.get("/dags/ana-cyc/analysis")
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "cycle_detected"
+
+
+def test_analysis_rejects_injected_missing_dependency(client):
+    submit(client, [{"key": "a"}], dag_id="ana-miss")
+    import sqlite3
+    from app.db import db_path
+
+    conn = sqlite3.connect(db_path())
+    conn.execute(
+        "INSERT INTO dependencies (dag_id, task_key, dep_key) VALUES ('ana-miss', 'a', 'ghost')"
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.get("/dags/ana-miss/analysis")
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "missing_dependency"
+    assert "ghost" in r.json()["error"]["details"]["missing"]
+
+
+def test_duration_seconds_exposed_in_task_views(client):
+    dag = submit(client, [{"key": "a", "duration_seconds": 7}], dag_id="ana-view")
+    assert by_key(dag, "a")["duration_seconds"] == 7
+
+    overview = client.get("/dags/ana-view").json()
+    assert by_key(overview, "a")["duration_seconds"] == 7
+
+    task_id = overview["tasks"][0]["id"]
+    detail = client.get(f"/tasks/{task_id}").json()
+    assert detail["duration_seconds"] == 7
+
+
+def test_legacy_sqlite_db_gets_duration_default(tmp_path, monkeypatch):
+    """旧版 tasks 表（无 duration_seconds 列）迁移后默认 1，分析可直接使用。"""
+    import sqlite3
+
+    db_file = tmp_path / "legacy-analysis.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(
+        """
+        CREATE TABLE dags (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, dag_id TEXT NOT NULL, task_key TEXT NOT NULL, name TEXT NOT NULL,
+            payload TEXT, max_retries INTEGER NOT NULL DEFAULT 0, lease_seconds REAL NOT NULL,
+            state TEXT NOT NULL, blocked_reason TEXT, lease_token TEXT, lease_expires_at TEXT,
+            worker_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            UNIQUE(dag_id, task_key));
+        CREATE TABLE dependencies (dag_id TEXT, task_key TEXT, dep_key TEXT,
+            PRIMARY KEY (dag_id, task_key, dep_key));
+        INSERT INTO dags VALUES ('d1', 'old', '2026-01-01T00:00:00Z');
+        INSERT INTO tasks (id, dag_id, task_key, name, max_retries, lease_seconds, state,
+                           attempt, created_at)
+        VALUES ('t1', 'd1', 'a', 'a', 0, 30, 'pending', 0, '2026-01-01T00:00:00Z');
+        INSERT INTO tasks (id, dag_id, task_key, name, max_retries, lease_seconds, state,
+                           attempt, created_at)
+        VALUES ('t2', 'd1', 'b', 'b', 0, 30, 'pending', 0, '2026-01-01T00:00:00Z');
+        INSERT INTO dependencies VALUES ('d1', 'b', 'a');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    from app.db import init_db
+    from app import service
+
+    init_db()
+    init_db()  # 迁移幂等
+
+    analysis = service.analyze_dag("d1")
+    assert analysis["total_duration_seconds"] == 1 + 1  # 历史任务默认时长 1
+    assert analysis["critical_path"] == ["a", "b"]
+    assert analysis["levels"] == [["a"], ["b"]]
