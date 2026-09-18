@@ -14,6 +14,13 @@ class TaskIn(BaseModel):
     deps: list[str] = Field(default_factory=list, description="前置任务的 key 列表")
     max_retries: int = Field(0, ge=0, description="失败后的额外重试次数")
     lease_seconds: float | None = Field(None, gt=0, description="租约时长，缺省取服务端默认值")
+    # 提交时不强制为正：非正时长由分析端点在读取时报告 422（见 GET /dags/{id}/analysis）；
+    # NaN/Inf 无法存入 SQLite，提交即拒绝。
+    duration_seconds: float | None = Field(
+        None,
+        allow_inf_nan=False,
+        description="预计执行时长（秒），供 DAG 工期分析使用；缺省为 1，必须为正数",
+    )
 
 
 class DAGSubmitIn(BaseModel):

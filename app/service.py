@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import heapq
 import json
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -187,10 +189,13 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
             for key in keys:
                 t = tasks_by_key[key]
                 lease = float(t.get("lease_seconds") or default_lease)
+                # 时长缺省为 1 秒；非正值原样落库，由分析端点在读取时报告 422
+                duration = t.get("duration_seconds")
+                duration = 1.0 if duration is None else float(duration)
                 conn.execute(
                     """INSERT INTO tasks (id, dag_id, task_key, name, payload,
-                           max_retries, lease_seconds, state, attempt, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                           max_retries, lease_seconds, duration_seconds, state, attempt, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
                     (
                         uuid.uuid4().hex,
                         dag_id,
@@ -199,6 +204,7 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                         _dumps(t.get("payload")),
                         int(t.get("max_retries") or 0),
                         lease,
+                        duration,
                         PENDING,
                         now,
                     ),
@@ -655,6 +661,7 @@ def _task_dict(conn, row, with_attempts: bool = True) -> dict[str, Any]:
         "attempt": row["attempt"],
         "failure_count": row["failure_count"],
         "max_retries": row["max_retries"],
+        "duration_seconds": row["duration_seconds"],
         # 剩余重试额度只与显式失败计数挂钩，与 attempt（含租约过期重领）无关
         "retries_remaining": max(0, row["max_retries"] - row["failure_count"]),
         "lease": lease,
@@ -719,6 +726,163 @@ def list_tasks(dag_id: str | None, state: str | None) -> dict[str, Any]:
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
         return {"tasks": [_task_dict(conn, r, with_attempts=False) for r in rows], "count": len(rows)}
+
+
+# ---------------------------------------------------------------- DAG 分析
+
+# 关键判定的浮点容差：前向/后向遍历沿相反方向做加减，
+# 关键任务的松弛量理论上为 0，用 epsilon 吸收二进制浮点误差。
+_SLACK_EPS = 1e-9
+
+
+def analyze_dag(dag_id: str) -> dict[str, Any]:
+    """只读工期分析（CPM）：按声明的依赖图与 duration_seconds 计算每任务
+    最早/最晚开始完成时间、总工期、关键路径、关键任务集合与并行层级。
+
+    一致性：DAG、任务、依赖边在同一个显式只读事务内读取（WAL 快照），
+    并发的领取/回报不会让三张表读到不同时间的版本；计算在快照数据上进行。
+    本函数只执行 SELECT，不改变任何任务状态，也不产生事件。
+    """
+    with get_conn() as conn:
+        conn.execute("BEGIN")  # 同一事务内的所有读取看到同一快照
+        try:
+            dag = conn.execute("SELECT * FROM dags WHERE id = ?", (dag_id,)).fetchone()
+            if dag is None:
+                raise APIError(404, "dag_not_found", f"DAG {dag_id} 不存在")
+            task_rows = conn.execute(
+                "SELECT task_key, duration_seconds FROM tasks WHERE dag_id = ? "
+                "ORDER BY created_at, task_key",
+                (dag_id,),
+            ).fetchall()
+            dep_rows = conn.execute(
+                "SELECT task_key, dep_key FROM dependencies WHERE dag_id = ? "
+                "ORDER BY task_key, dep_key",
+                (dag_id,),
+            ).fetchall()
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    # ---- 时长校验：提交时原样落库，分析时发现非正/非有限值即 422
+    durations: dict[str, float] = {}
+    invalid: list[str] = []
+    for row in task_rows:
+        raw = row["duration_seconds"]
+        d = 1.0 if raw is None else float(raw)
+        if not math.isfinite(d) or d <= 0:
+            invalid.append(row["task_key"])
+        durations[row["task_key"]] = d
+    if invalid:
+        raise APIError(
+            422,
+            "invalid_duration",
+            "存在非正的 duration_seconds，无法进行工期分析",
+            {"tasks": sorted(invalid)},
+        )
+
+    keys = [r["task_key"] for r in task_rows]
+    if not keys:  # 提交接口保证至少一个任务；走到这里说明库存数据异常
+        raise APIError(422, "empty_dag", "DAG 不包含任何任务，无法分析")
+    key_set = set(keys)
+
+    # ---- 图校验：依赖边必须指向已声明任务（正常提交已保证，此处防御异常数据）
+    preds: dict[str, list[str]] = {k: [] for k in keys}
+    succs: dict[str, list[str]] = {k: [] for k in keys}
+    dangling: set[str] = set()
+    for row in dep_rows:
+        tk, dk = row["task_key"], row["dep_key"]
+        if tk not in key_set or dk not in key_set:
+            dangling.add(tk if tk not in key_set else dk)
+            continue
+        preds[tk].append(dk)
+        succs[dk].append(tk)
+    if dangling:
+        raise APIError(
+            422, "missing_dependency", "依赖边指向不存在的任务", {"missing": sorted(dangling)}
+        )
+
+    # ---- 拓扑排序（Kahn；堆使并列候选按字典序弹出，结果确定）
+    indegree = {k: len(preds[k]) for k in keys}
+    heap = [k for k in keys if indegree[k] == 0]
+    heapq.heapify(heap)
+    topo: list[str] = []
+    while heap:
+        k = heapq.heappop(heap)
+        topo.append(k)
+        for s in succs[k]:
+            indegree[s] -= 1
+            if indegree[s] == 0:
+                heapq.heappush(heap, s)
+    if len(topo) != len(keys):  # 有环：提交时已拒绝，此处防御异常数据
+        cycle = _find_cycle(key_set, preds)
+        raise APIError(422, "cycle_detected", "依赖图存在环，无法分析", {"cycle": cycle})
+
+    # ---- 前向遍历：最早开始/完成；层级 = 到源点最长链上的任务数 - 1
+    es: dict[str, float] = {}
+    ef: dict[str, float] = {}
+    level: dict[str, int] = {}
+    for k in topo:
+        es[k] = max((ef[p] for p in preds[k]), default=0.0)
+        ef[k] = es[k] + durations[k]
+        level[k] = max((level[p] for p in preds[k]), default=-1) + 1
+    total = max(ef.values())  # 总工期：所有任务最早完成时间的最大值
+
+    # ---- 后向遍历：最晚开始/完成；松弛量 ≈ 0 的任务构成关键任务集合
+    lf: dict[str, float] = {}
+    ls: dict[str, float] = {}
+    for k in reversed(topo):
+        lf[k] = min((ls[s] for s in succs[k]), default=total)
+        ls[k] = lf[k] - durations[k]
+    slack = {k: ls[k] - es[k] for k in keys}
+    critical = [k for k in topo if slack[k] <= _SLACK_EPS]
+
+    # ---- 关键路径：从“完成时间等于总工期”的关键终点出发，
+    # 沿紧密衔接（前置完成 == 当前开始）的关键前置回溯到源点
+    topo_index = {k: i for i, k in enumerate(topo)}
+    end = next(k for k in topo if slack[k] <= _SLACK_EPS and total - ef[k] <= _SLACK_EPS)
+    path = [end]
+    while True:
+        cur = path[0]
+        tight = [
+            p
+            for p in preds[cur]
+            if slack[p] <= _SLACK_EPS and abs(ef[p] - es[cur]) <= _SLACK_EPS
+        ]
+        if not tight:
+            break
+        path.insert(0, min(tight, key=lambda p: topo_index[p]))
+
+    # ---- 并行层级：同层任务互不依赖，获得足够工作器即可并行执行
+    levels = [
+        {"level": lv, "tasks": sorted(k for k in keys if level[k] == lv)}
+        for lv in range(max(level.values()) + 1)
+    ]
+
+    return {
+        "dag_id": dag["id"],
+        "task_count": len(keys),
+        "total_duration_seconds": total,
+        "critical_path": path,
+        "critical_tasks": critical,
+        "levels": levels,
+        "tasks": [
+            {
+                "key": k,
+                "duration_seconds": durations[k],
+                "level": level[k],
+                "earliest_start_seconds": es[k],
+                "earliest_finish_seconds": ef[k],
+                "latest_start_seconds": ls[k],
+                "latest_finish_seconds": lf[k],
+                # 浮点噪声可能让关键任务的松弛量呈微小负数，输出时截断到 0
+                "slack_seconds": max(slack[k], 0.0),
+                "is_critical": slack[k] <= _SLACK_EPS,
+            }
+            for k in topo
+        ],
+    }
 
 
 # ---------------------------------------------------------------- 事件流

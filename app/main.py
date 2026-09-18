@@ -52,6 +52,11 @@ def get_dag(dag_id: str) -> dict:
     return service.get_dag(dag_id)
 
 
+@app.get("/dags/{dag_id}/analysis")
+def analyze_dag(dag_id: str) -> dict:
+    return service.analyze_dag(dag_id)
+
+
 @app.post("/tasks/claim")
 def claim_tasks(body: ClaimIn) -> dict:
     return service.claim_tasks(body.worker_id, body.dag_id, body.limit)

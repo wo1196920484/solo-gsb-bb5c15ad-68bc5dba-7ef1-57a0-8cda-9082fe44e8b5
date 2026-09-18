@@ -38,6 +38,12 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   跨页与重启均不漏项、不重复。
 - **状态接口**：DAG 概览给出各状态计数；任务详情列出每次尝试的状态、租约令牌、
   过期时间、心跳时间、错误信息，以及当前租约是否已过期和阻塞原因。
+- **只读工期分析**：任务可声明 `duration_seconds`（预计执行时长，缺省 1 秒）。
+  `GET /dags/{dag_id}/analysis` 按声明的依赖图做 CPM 分析：在**单个只读事务的
+  一致快照**上读取任务与依赖边，计算每任务的最早/最晚开始完成时间、松弛量、
+  总工期、关键路径、关键任务集合与并行层级（同层任务互不依赖、可并行执行）。
+  分析是纯静态计算，与任务当前运行状态无关，不改变任何任务状态、不产生事件；
+  DAG 不存在返回 `404`，存在非正 `duration_seconds` 或图数据异常返回 `422`。
 
 ## 一条命令启动（端口 8000）
 
@@ -189,7 +195,65 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 被阻塞后继示例：`{"key": "load", "state": "blocked", "blocked_reason":
 "upstream 'transform' permanently failed", "lease": null}`。
 
-### 6. 事件流
+### 6. DAG 工期分析
+
+任务提交时可声明 `duration_seconds`（预计执行时长，缺省 1 秒）。分析端点在
+单个只读事务的一致快照上读取任务与依赖边，按 CPM（关键路径法）计算静态工期，
+与任务当前运行状态无关，也不改变任何状态或事件：
+
+```bash
+curl -s -X POST http://localhost:8000/dags \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "etl", "id": "etl-1",
+    "tasks": [
+      {"key": "extract",   "duration_seconds": 2},
+      {"key": "transform", "deps": ["extract"], "duration_seconds": 5},
+      {"key": "enrich",    "deps": ["extract"], "duration_seconds": 3},
+      {"key": "load",      "deps": ["transform", "enrich"]}
+    ]
+  }'
+
+curl -s http://localhost:8000/dags/etl-1/analysis | jq
+```
+
+```json
+{
+  "dag_id": "etl-1",
+  "task_count": 4,
+  "total_duration_seconds": 8.0,
+  "critical_path": ["extract", "transform", "load"],
+  "critical_tasks": ["extract", "transform", "load"],
+  "levels": [
+    {"level": 0, "tasks": ["extract"]},
+    {"level": 1, "tasks": ["enrich", "transform"]},
+    {"level": 2, "tasks": ["load"]}
+  ],
+  "tasks": [
+    {"key": "extract", "duration_seconds": 2.0, "level": 0,
+     "earliest_start_seconds": 0.0, "earliest_finish_seconds": 2.0,
+     "latest_start_seconds": 0.0, "latest_finish_seconds": 2.0,
+     "slack_seconds": 0.0, "is_critical": true},
+    {"key": "enrich", "duration_seconds": 3.0, "level": 1,
+     "earliest_start_seconds": 2.0, "earliest_finish_seconds": 5.0,
+     "latest_start_seconds": 4.0, "latest_finish_seconds": 7.0,
+     "slack_seconds": 2.0, "is_critical": false}
+  ]
+}
+```
+
+- `total_duration_seconds`：总工期，即所有任务最早完成时间的最大值；
+- `critical_path`：一条从源点到终点、松弛量为 0 的关键任务链（总工期的决定者）；
+- `critical_tasks`：全部关键任务集合（松弛量 ≈ 0）；
+- `levels`：并行层级，同层任务互不依赖，工作器足够时可并行执行；
+- 每任务给出最早/最晚开始完成时间（相对开工时刻的秒偏移）与 `slack_seconds`。
+
+错误语义：DAG 不存在 → `404 dag_not_found`；任一任务 `duration_seconds`
+非正 → `422 invalid_duration`（`details.tasks` 列出违规任务键）；图中存在
+悬空依赖边或环（正常提交已拦截，仅异常数据可能触发）→ `422 missing_dependency`
+/ `422 cycle_detected`。
+
+### 7. 事件流
 
 事件流只增不改，记录全部关键状态变迁。每条事件形如：
 
@@ -260,6 +324,7 @@ curl -s 'http://localhost:8000/events?dag_id=<DAG_ID>&after=0&limit=100'
 | --- | --- | --- |
 | `POST` | `/dags` | 提交 DAG（校验缺失依赖与环） |
 | `GET` | `/dags/{dag_id}` | DAG 概览：状态计数与任务列表 |
+| `GET` | `/dags/{dag_id}/analysis` | 只读工期分析：最早/最晚时间、总工期、关键路径、并行层级 |
 | `POST` | `/tasks/claim` | 原子领取前置全部成功的任务 |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
 | `GET` | `/events?after=&limit=&dag_id=` | 不可变事件流：按 sequence 升序键集分页 |
@@ -289,4 +354,6 @@ pytest -q
 attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试与耗尽后递归阻塞、
 幂等回报（重放同响应、内容冲突 409、键序等价、重启后持久化）、旧 SQLite 数据迁移、
 状态接口、持久化事件流（各事件类型与状态对、同事务回滚不留事件、重放不产生事件、
-键集分页无漏项/重复、dag_id 过滤、参数校验、重启后不重置、存储层不可变）。
+键集分页无漏项/重复、dag_id 过滤、参数校验、重启后不重置、存储层不可变）、
+工期分析（CPM 最早/最晚时间与松弛量、总工期、关键路径与关键任务集合、并行层级、
+默认时长 1 秒、404/422 错误语义、只读且与运行状态无关、旧库迁移后按默认时长分析）。

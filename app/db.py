@@ -59,6 +59,8 @@ def init_db(path: Path | None = None) -> None:
                 payload             TEXT,
                 max_retries         INTEGER NOT NULL DEFAULT 0,
                 lease_seconds       REAL NOT NULL,
+                -- 预计执行时长（秒），供 GET /dags/{id}/analysis 的 CPM 分析使用
+                duration_seconds    REAL NOT NULL DEFAULT 1,
                 state               TEXT NOT NULL,        -- pending/running/succeeded/failed/blocked
                 blocked_reason      TEXT,
                 lease_token         TEXT,
@@ -149,6 +151,13 @@ def init_db(path: Path | None = None) -> None:
         if "failure_count" not in columns:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # 旧版 SQLite 数据库迁移：为已有任务补齐预计时长列。
+        # 历史任务此前没有声明过时长的概念，一律按分析默认值 1 秒处理。
+        if "duration_seconds" not in columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN duration_seconds REAL NOT NULL DEFAULT 1"
             )
 
 
